@@ -227,6 +227,259 @@
     )
 )
 
+;; StacksGuard: Decentralized Insurance Protocol
+;; Commit 3: Claims processing system and read-only functions
+
+;; Claims management functions
+(define-public (submit-claim
+        (policy-id uint)
+        (amount uint)
+        (description (string-ascii 500))
+    )
+    (let (
+            (claim-id (var-get next-claim-id))
+            (policy (unwrap! (map-get? policies { policy-id: policy-id })
+                ERR_POLICY_NOT_FOUND
+            ))
+        )
+        (asserts! (not (var-get contract-paused)) ERR_UNAUTHORIZED)
+        (asserts! (is-eq (get holder policy) tx-sender) ERR_UNAUTHORIZED)
+        (asserts! (is-policy-active policy-id) ERR_POLICY_EXPIRED)
+        (asserts! (<= amount (get coverage-amount policy)) ERR_INVALID_AMOUNT)
+        (asserts! (> (len description) u0) ERR_INVALID_AMOUNT)
+        ;; Create claim
+        (map-set claims { claim-id: claim-id } {
+            policy-id: policy-id,
+            claimant: tx-sender,
+            amount: amount,
+            description: description,
+            submitted-at: stacks-block-height,
+            status: "pending",
+            votes-for: u0,
+            votes-against: u0,
+            voting-ends-at: (+ stacks-block-height CLAIM_VOTING_PERIOD),
+        })
+        ;; Update policy claims count
+        (map-set policies { policy-id: policy-id }
+            (merge policy { claims-made: (+ (get claims-made policy) u1) })
+        )
+        (var-set next-claim-id (+ claim-id u1))
+        (ok claim-id)
+    )
+)
+
+(define-public (vote-on-claim
+        (claim-id uint)
+        (approve bool)
+    )
+    (let (
+            (claim (unwrap! (map-get? claims { claim-id: claim-id }) ERR_CLAIM_NOT_FOUND))
+            (policy (unwrap! (map-get? policies { policy-id: (get policy-id claim) })
+                ERR_POLICY_NOT_FOUND
+            ))
+            (pool-id (get pool-id policy))
+            (stake (unwrap!
+                (map-get? underwriter-stakes {
+                    underwriter: tx-sender,
+                    pool-id: pool-id,
+                })
+                ERR_UNAUTHORIZED
+            ))
+            (voting-power (calculate-voting-power (get staked-amount stake)))
+        )
+        (asserts! (not (var-get contract-paused)) ERR_UNAUTHORIZED)
+        (asserts! (get is-active stake) ERR_UNAUTHORIZED)
+        (asserts! (is-eq (get status claim) "pending")
+            ERR_CLAIM_ALREADY_PROCESSED
+        )
+        (asserts! (<= stacks-block-height (get voting-ends-at claim))
+            ERR_POLICY_EXPIRED
+        )
+        (asserts!
+            (is-none (map-get? claim-votes {
+                claim-id: claim-id,
+                voter: tx-sender,
+            }))
+            ERR_CLAIM_ALREADY_PROCESSED
+        )
+        ;; Record vote
+        (map-set claim-votes {
+            claim-id: claim-id,
+            voter: tx-sender,
+        } {
+            vote: approve,
+            voting-power: voting-power,
+            voted-at: stacks-block-height,
+        })
+        ;; Update claim vote counts
+        (if approve
+            (map-set claims { claim-id: claim-id }
+                (merge claim { votes-for: (+ (get votes-for claim) voting-power) })
+            )
+            (map-set claims { claim-id: claim-id }
+                (merge claim { votes-against: (+ (get votes-against claim) voting-power) })
+            )
+        )
+        (ok true)
+    )
+)
+
+(define-public (process-claim (claim-id uint))
+    (let (
+            (claim (unwrap! (map-get? claims { claim-id: claim-id }) ERR_CLAIM_NOT_FOUND))
+            (policy (unwrap! (map-get? policies { policy-id: (get policy-id claim) })
+                ERR_POLICY_NOT_FOUND
+            ))
+        )
+        (asserts! (not (var-get contract-paused)) ERR_UNAUTHORIZED)
+        (asserts! (is-eq (get status claim) "pending")
+            ERR_CLAIM_ALREADY_PROCESSED
+        )
+        (asserts! (> stacks-block-height (get voting-ends-at claim))
+            ERR_CLAIM_NOT_FOUND
+        )
+        (let (
+                (total-votes (+ (get votes-for claim) (get votes-against claim)))
+                (approval-threshold (/ total-votes u2))
+            )
+            ;; Simple majority
+            (if (> (get votes-for claim) approval-threshold)
+                (begin
+                    ;; Approve claim - transfer funds to claimant
+                    (try! (as-contract (stx-transfer? (get amount claim) tx-sender
+                        (get claimant claim)
+                    )))
+                    (map-set claims { claim-id: claim-id }
+                        (merge claim { status: "approved" })
+                    )
+                    (ok "approved")
+                )
+                (begin
+                    ;; Reject claim
+                    (map-set claims { claim-id: claim-id }
+                        (merge claim { status: "rejected" })
+                    )
+                    (ok "rejected")
+                )
+            )
+        )
+    )
+)
+
+(define-public (unstake-from-pool
+        (pool-id uint)
+        (amount uint)
+    )
+    (let (
+            (stake (unwrap!
+                (map-get? underwriter-stakes {
+                    underwriter: tx-sender,
+                    pool-id: pool-id,
+                })
+                ERR_UNAUTHORIZED
+            ))
+            (pool (unwrap! (map-get? insurance-pools { pool-id: pool-id })
+                ERR_POOL_NOT_FOUND
+            ))
+        )
+        (asserts! (not (var-get contract-paused)) ERR_UNAUTHORIZED)
+        (asserts! (get is-active stake) ERR_UNAUTHORIZED)
+        (asserts! (<= amount (get staked-amount stake)) ERR_INSUFFICIENT_BALANCE)
+        (asserts! (> amount u0) ERR_INVALID_AMOUNT)
+        ;; Transfer STX back to user
+        (try! (as-contract (stx-transfer? amount tx-sender tx-sender)))
+        ;; Update stake record
+        (let ((new-staked-amount (- (get staked-amount stake) amount)))
+            (if (is-eq new-staked-amount u0)
+                (map-set underwriter-stakes {
+                    underwriter: tx-sender,
+                    pool-id: pool-id,
+                }
+                    (merge stake {
+                        staked-amount: u0,
+                        is-active: false,
+                    })
+                )
+                (map-set underwriter-stakes {
+                    underwriter: tx-sender,
+                    pool-id: pool-id,
+                }
+                    (merge stake { staked-amount: new-staked-amount })
+                )
+            )
+        )
+        ;; Update pool total
+        (map-set insurance-pools { pool-id: pool-id }
+            (merge pool { total-staked: (- (get total-staked pool) amount) })
+        )
+        (ok true)
+    )
+)
+
+;; Read-only functions
+(define-read-only (get-pool-info (pool-id uint))
+    (map-get? insurance-pools { pool-id: pool-id })
+)
+
+(define-read-only (get-policy-info (policy-id uint))
+    (map-get? policies { policy-id: policy-id })
+)
+
+(define-read-only (get-claim-info (claim-id uint))
+    (map-get? claims { claim-id: claim-id })
+)
+
+(define-read-only (get-underwriter-stake
+        (underwriter principal)
+        (pool-id uint)
+    )
+    (map-get? underwriter-stakes {
+        underwriter: underwriter,
+        pool-id: pool-id,
+    })
+)
+
+(define-read-only (get-contract-stats)
+    {
+        total-pools: (- (var-get next-pool-id) u1),
+        total-policies: (- (var-get next-policy-id) u1),
+        total-claims: (- (var-get next-claim-id) u1),
+        protocol-fees: (var-get total-protocol-fees),
+        is-paused: (var-get contract-paused),
+    }
+)
+
+(define-read-only (calculate-policy-premium
+        (coverage-amount uint)
+        (duration uint)
+        (pool-id uint)
+    )
+    (match (map-get? insurance-pools { pool-id: pool-id })
+        pool (ok (calculate-premium coverage-amount duration (get risk-factor pool)))
+        ERR_POOL_NOT_FOUND
+    )
+)
+
+(define-read-only (is-policy-valid (policy-id uint))
+    (is-policy-active policy-id)
+)
+
+(define-read-only (get-voting-power-for-user
+        (user principal)
+        (pool-id uint)
+    )
+    (match (map-get? underwriter-stakes {
+        underwriter: user,
+        pool-id: pool-id,
+    })
+        stake (if (get is-active stake)
+            (ok (calculate-voting-power (get staked-amount stake)))
+            (ok u0)
+        )
+        (ok u0)
+    )
+)
+
 (define-public (stake-in-pool
         (pool-id uint)
         (amount uint)
