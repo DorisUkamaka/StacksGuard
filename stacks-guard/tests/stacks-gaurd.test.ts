@@ -338,3 +338,313 @@ describe("StacksGuard Contract Tests", () => {
     });
   });
 });
+
+describe("Policy Management", () => {
+    beforeEach(() => {
+      // Create a pool and stake funds for policy tests
+      simnet.callPublicFn("stacks-guard", "create-insurance-pool", [
+        Cl.stringAscii("Test Pool"),
+        Cl.stringAscii("Pool for policy tests"),
+        Cl.uint(50)
+      ], address1);
+      
+      // Stake enough to cover policies
+      simnet.callPublicFn("stacks-guard", "stake-in-pool", [
+        Cl.uint(1),
+        Cl.uint(100000000) // 100 STX
+      ], address2);
+    });
+
+    it("calculates premium correctly", () => {
+      const coverageAmount = 10000000; // 10 STX
+      const duration = 1000; // blocks
+      
+      const { result } = simnet.callReadOnlyFn("stacks-guard", "calculate-policy-premium", [
+        Cl.uint(coverageAmount),
+        Cl.uint(duration),
+        Cl.uint(1) // pool-id
+      ], address1);
+      
+      expect(result).toBeOk(Cl.uint(expect.any(Number)));
+    });
+
+    it("returns error for premium calculation on non-existent pool", () => {
+      const { result } = simnet.callReadOnlyFn("stacks-guard", "calculate-policy-premium", [
+        Cl.uint(10000000),
+        Cl.uint(1000),
+        Cl.uint(999) // Non-existent pool
+      ], address1);
+      
+      expect(result).toBeErr(Cl.uint(410)); // ERR_POOL_NOT_FOUND
+    });
+
+    it("allows purchasing policy with valid parameters", () => {
+      const coverageAmount = 10000000; // 10 STX
+      const duration = 1000; // blocks
+      
+      const { result } = simnet.callPublicFn("stacks-guard", "purchase-policy", [
+        Cl.uint(1), // pool-id
+        Cl.uint(coverageAmount),
+        Cl.uint(duration)
+      ], address1);
+      
+      expect(result).toBeOk(Cl.uint(1)); // First policy ID should be 1
+    });
+
+    it("prevents purchasing policy with coverage below minimum", () => {
+      const invalidCoverage = MIN_PREMIUM - 1;
+      const duration = 1000;
+      
+      const { result } = simnet.callPublicFn("stacks-guard", "purchase-policy", [
+        Cl.uint(1),
+        Cl.uint(invalidCoverage),
+        Cl.uint(duration)
+      ], address1);
+      
+      expect(result).toBeErr(Cl.uint(402)); // ERR_INVALID_AMOUNT
+    });
+
+    it("prevents purchasing policy with coverage above maximum", () => {
+      const invalidCoverage = MAX_COVERAGE + 1;
+      const duration = 1000;
+      
+      const { result } = simnet.callPublicFn("stacks-guard", "purchase-policy", [
+        Cl.uint(1),
+        Cl.uint(invalidCoverage),
+        Cl.uint(duration)
+      ], address1);
+      
+      expect(result).toBeErr(Cl.uint(402)); // ERR_INVALID_AMOUNT
+    });
+
+    it("prevents purchasing policy with duration below minimum", () => {
+      const coverageAmount = 10000000;
+      const invalidDuration = MIN_DURATION - 1;
+      
+      const { result } = simnet.callPublicFn("stacks-guard", "purchase-policy", [
+        Cl.uint(1),
+        Cl.uint(coverageAmount),
+        Cl.uint(invalidDuration)
+      ], address1);
+      
+      expect(result).toBeErr(Cl.uint(409)); // ERR_INVALID_DURATION
+    });
+
+    it("prevents purchasing policy with duration above maximum", () => {
+      const coverageAmount = 10000000;
+      const invalidDuration = MAX_DURATION + 1;
+      
+      const { result } = simnet.callPublicFn("stacks-guard", "purchase-policy", [
+        Cl.uint(1),
+        Cl.uint(coverageAmount),
+        Cl.uint(invalidDuration)
+      ], address1);
+      
+      expect(result).toBeErr(Cl.uint(409)); // ERR_INVALID_DURATION
+    });
+
+    it("prevents purchasing policy from non-existent pool", () => {
+      const { result } = simnet.callPublicFn("stacks-guard", "purchase-policy", [
+        Cl.uint(999), // Non-existent pool
+        Cl.uint(10000000),
+        Cl.uint(1000)
+      ], address1);
+      
+      expect(result).toBeErr(Cl.uint(410)); // ERR_POOL_NOT_FOUND
+    });
+
+    it("prevents purchasing policy when contract is paused", () => {
+      simnet.callPublicFn("stacks-guard", "pause-contract", [], deployer);
+      
+      const { result } = simnet.callPublicFn("stacks-guard", "purchase-policy", [
+        Cl.uint(1),
+        Cl.uint(10000000),
+        Cl.uint(1000)
+      ], address1);
+      
+      expect(result).toBeErr(Cl.uint(401)); // ERR_UNAUTHORIZED
+    });
+
+    it("prevents purchasing policy with insufficient pool coverage", () => {
+      // Create a pool with minimal staking
+      simnet.callPublicFn("stacks-guard", "create-insurance-pool", [
+        Cl.stringAscii("Small Pool"),
+        Cl.stringAscii("Pool with minimal funds"),
+        Cl.uint(30)
+      ], address1);
+      
+      simnet.callPublicFn("stacks-guard", "stake-in-pool", [
+        Cl.uint(2), // New pool ID
+        Cl.uint(MIN_STAKE) // Minimal stake
+      ], address2);
+      
+      const { result } = simnet.callPublicFn("stacks-guard", "purchase-policy", [
+        Cl.uint(2),
+        Cl.uint(50000000), // 50 STX - more than pool has
+        Cl.uint(1000)
+      ], address1);
+      
+      expect(result).toBeErr(Cl.uint(408)); // ERR_INSUFFICIENT_COVERAGE
+    });
+
+    it("creates multiple policies", () => {
+      const coverageAmount = 5000000; // 5 STX
+      const duration = 1000;
+      
+      const { result: policy1 } = simnet.callPublicFn("stacks-guard", "purchase-policy", [
+        Cl.uint(1),
+        Cl.uint(coverageAmount),
+        Cl.uint(duration)
+      ], address1);
+      expect(policy1).toBeOk(Cl.uint(1));
+      
+      const { result: policy2 } = simnet.callPublicFn("stacks-guard", "purchase-policy", [
+        Cl.uint(1),
+        Cl.uint(coverageAmount),
+        Cl.uint(duration)
+      ], address3);
+      expect(policy2).toBeOk(Cl.uint(2));
+    });
+
+    it("updates contract stats after policy purchase", () => {
+      simnet.callPublicFn("stacks-guard", "purchase-policy", [
+        Cl.uint(1),
+        Cl.uint(10000000),
+        Cl.uint(1000)
+      ], address1);
+      
+      const { result } = simnet.callReadOnlyFn("stacks-guard", "get-contract-stats", [], deployer);
+      expect(result).toEqual(
+        Cl.tuple({
+          "total-pools": Cl.uint(1),
+          "total-policies": Cl.uint(1),
+          "total-claims": Cl.uint(0),
+          "protocol-fees": Cl.uint(expect.any(Number)),
+          "is-paused": Cl.bool(false),
+        })
+      );
+    });
+
+    it("updates pool active policies count", () => {
+      simnet.callPublicFn("stacks-guard", "purchase-policy", [
+        Cl.uint(1),
+        Cl.uint(10000000),
+        Cl.uint(1000)
+      ], address1);
+      
+      const { result } = simnet.callReadOnlyFn("stacks-guard", "get-pool-info", [Cl.uint(1)], address1);
+      expect(result).toBeSome(
+        Cl.tuple({
+          name: Cl.stringAscii("Test Pool"),
+          description: Cl.stringAscii("Pool for policy tests"),
+          "total-staked": Cl.uint(100000000),
+          "active-policies": Cl.uint(1),
+          "risk-factor": Cl.uint(50),
+          "created-at": Cl.uint(simnet.blockHeight - 2),
+          "is-active": Cl.bool(true),
+        })
+      );
+    });
+
+    it("retrieves policy information correctly", () => {
+      const coverageAmount = 10000000;
+      const duration = 1000;
+      
+      simnet.callPublicFn("stacks-guard", "purchase-policy", [
+        Cl.uint(1),
+        Cl.uint(coverageAmount),
+        Cl.uint(duration)
+      ], address1);
+      
+      const { result } = simnet.callReadOnlyFn("stacks-guard", "get-policy-info", [Cl.uint(1)], address1);
+      expect(result).toBeSome(
+        Cl.tuple({
+          holder: Cl.principal(address1),
+          "pool-id": Cl.uint(1),
+          "coverage-amount": Cl.uint(coverageAmount),
+          "premium-paid": Cl.uint(expect.any(Number)),
+          "start-block": Cl.uint(simnet.blockHeight),
+          "end-block": Cl.uint(simnet.blockHeight + duration),
+          "is-active": Cl.bool(true),
+          "claims-made": Cl.uint(0),
+        })
+      );
+    });
+
+    it("returns none for non-existent policy", () => {
+      const { result } = simnet.callReadOnlyFn("stacks-guard", "get-policy-info", [Cl.uint(999)], address1);
+      expect(result).toBeNone();
+    });
+
+    it("validates policy status correctly", () => {
+      simnet.callPublicFn("stacks-guard", "purchase-policy", [
+        Cl.uint(1),
+        Cl.uint(10000000),
+        Cl.uint(1000)
+      ], address1);
+      
+      const { result } = simnet.callReadOnlyFn("stacks-guard", "is-policy-valid", [Cl.uint(1)], address1);
+      expect(result).toBeBool(true);
+    });
+
+    it("returns false for expired policy", () => {
+      // Create a policy with short duration
+      simnet.callPublicFn("stacks-guard", "purchase-policy", [
+        Cl.uint(1),
+        Cl.uint(10000000),
+        Cl.uint(MIN_DURATION) // Minimum duration
+      ], address1);
+      
+      // Advance blocks beyond policy duration
+      simnet.mineEmptyBlocks(MIN_DURATION + 1);
+      
+      const { result } = simnet.callReadOnlyFn("stacks-guard", "is-policy-valid", [Cl.uint(1)], address1);
+      expect(result).toBeBool(false);
+    });
+
+    it("returns false for non-existent policy", () => {
+      const { result } = simnet.callReadOnlyFn("stacks-guard", "is-policy-valid", [Cl.uint(999)], address1);
+      expect(result).toBeBool(false);
+    });
+
+    it("handles premium calculation with different risk factors", () => {
+      // Create pools with different risk factors
+      simnet.callPublicFn("stacks-guard", "create-insurance-pool", [
+        Cl.stringAscii("Low Risk Pool"),
+        Cl.stringAscii("Pool with low risk"),
+        Cl.uint(10) // Low risk
+      ], address1);
+      
+      simnet.callPublicFn("stacks-guard", "create-insurance-pool", [
+        Cl.stringAscii("High Risk Pool"),
+        Cl.stringAscii("Pool with high risk"),
+        Cl.uint(90) // High risk
+      ], address1);
+      
+      // Stake in both pools
+      simnet.callPublicFn("stacks-guard", "stake-in-pool", [Cl.uint(2), Cl.uint(50000000)], address2);
+      simnet.callPublicFn("stacks-guard", "stake-in-pool", [Cl.uint(3), Cl.uint(50000000)], address2);
+      
+      const coverageAmount = 10000000;
+      const duration = 1000;
+      
+      const { result: lowRiskPremium } = simnet.callReadOnlyFn("stacks-guard", "calculate-policy-premium", [
+        Cl.uint(coverageAmount),
+        Cl.uint(duration),
+        Cl.uint(2) // Low risk pool
+      ], address1);
+      
+      const { result: highRiskPremium } = simnet.callReadOnlyFn("stacks-guard", "calculate-policy-premium", [
+        Cl.uint(coverageAmount),
+        Cl.uint(duration),
+        Cl.uint(3) // High risk pool
+      ], address1);
+      
+      expect(lowRiskPremium).toBeOk(Cl.uint(expect.any(Number)));
+      expect(highRiskPremium).toBeOk(Cl.uint(expect.any(Number)));
+      // High risk should have higher premium than low risk
+      const lowRiskAmount = (lowRiskPremium as { value: { value: bigint } }).value.value;
+      const highRiskAmount = (highRiskPremium as { value: { value: bigint } }).value.value;
+      expect(Number(highRiskAmount)).toBeGreaterThan(Number(lowRiskAmount));
+    });
+  });
