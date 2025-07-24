@@ -497,16 +497,14 @@
                 })
             ))
             (pool (unwrap! (map-get? insurance-pools { pool-id: pool-id })
-                (err ERR_POOL_NOT_FOUND)
+                ERR_POOL_NOT_FOUND
             ))
         )
         ;; Validate contract state and inputs
-        (asserts! (not (var-get contract-paused)) (err ERR_UNAUTHORIZED))
-        (asserts! (>= amount MIN_STAKE) (err ERR_INVALID_AMOUNT))
+        (asserts! (not (var-get contract-paused)) ERR_UNAUTHORIZED)
+        (asserts! (>= amount MIN_STAKE) ERR_INVALID_AMOUNT)
         ;; Transfer STX from user to contract
-        (let ((transfer-result (stx-transfer? amount tx-sender (as-contract tx-sender))))
-            (unwrap! transfer-result ERR_UNAUTHORIZED)
-        )
+        (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
         ;; Update pool total staked
         (map-set insurance-pools { pool-id: pool-id }
             (merge pool { total-staked: (+ (get total-staked pool) amount) })
@@ -517,7 +515,7 @@
             pool-id: pool-id,
         } {
             staked-amount: (+ (get staked-amount existing-stake) amount),
-            staked-at: block-height,
+            staked-at: stacks-block-height,
             rewards-earned: (get rewards-earned existing-stake),
             is-active: true,
         })
